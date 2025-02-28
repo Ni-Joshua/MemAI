@@ -15,20 +15,20 @@ claude = anthropic.Anthropic(
     api_key=os.environ.get("ANTHROPIC_API_KEY"),
 )
 gpt = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
-deepseek = OpenAI(api_key=os.environ.get("DEEPSEEK_API_KEY"), base_url="https://api.deepseek.com")
-llama = LlamaAPI(os.environ.get("LLAMA_API_KEY"))
+deepseek = OpenAI(api_key=os.environ.get("DEEPSEEK_API_KEY"), base_url="https://api.deepseek.com/v1")
+llama = OpenAI(api_key= os.environ.get("LLAMA_API_KEY"), base_url = "https://api.llama-api.com")
 gemini = genai.GenerativeModel(model_name="models/gemini-2.0-flash")
 
 modelNames = ["Gemini", "Claude", "GPT", "DeepSeek", "Llama"]
-# subjects = ["History", "Math", "Physics", "Linguistics"]
-columns = ["Response", "Ground_Truth", "Time", "Model"]
+columns = ["Response", "Ground_Truth", "Time", "Model", "Recitation"]
 
 instruction = "You are a teacher. "
-# prompt = "You are a teacher. Based off the image, how correct is the following understandng of the material? Assume that the student can only speak the material. Please give an accurate score between 0 and 10 before your response, with 0 being the least accurate and 10 being perfect. Penalize errors in important information more heavily than other errors. Please also provide corrections if necessary."
-prompt = "Based off the image, how correct is the following exact verbal recitation of the material? Assume that the student can only speak the material. Please give an accurate score between 0 and 10, with 0 being the least accurate and 10 being perfect. Penalize errors in important information more heavily than other errors. Please also provide corrections if necessary."
+# prompt = "You are a teacher. Based off the image, how correct is the following understandng of the material? Assume that the student can only speak the material meaning all symbols are pronounced. Please give an accurate score between 0 and 10 before your response, with 0 being the least accurate and 10 being perfect. Penalize errors in important information more heavily than other errors. Please also provide corrections if necessary."
+prompt = "Based off the image, how correct is the following exact verbal recitation of the material? Assume that the student can only speak the material, meaning all symbols are pronounced. Please give an accurate score between 0 and 10, with 0 being the least accurate and 10 being perfect. Penalize errors in important information more heavily than other errors. Please also provide corrections if necessary. "
 
 
 geminiFileMap = {}
+base64FileMap = {}
 def geminiUpload(filePath, mime_type):
     sampleFile = genai.upload_file(
         path=filePath,
@@ -41,90 +41,116 @@ def uploadAll(testMaterials):
     groundTruths = set(testMaterials["Ground_Truth"])
     for filePath in groundTruths:
         geminiUpload(filePath, "image/png")
+        image_data = encodeImage(filePath)
+        base64FileMap[filePath] = image_data
 
+
+def encodeImage(filePath):
+    with open(filePath, "rb") as image_file:
+        image_data = base64.b64encode(image_file.read()).decode('utf-8')
+    return image_data
+
+
+def callGemini(currentTest):
+    file = geminiFileMap[currentTest["Ground_Truth"]]
+    response = gemini.generate_content(
+        contents=[instruction, prompt, currentTest["Recitation"], file]
+    )
+    return response
+
+def callClaude(currentTest):
+    currentImage = base64FileMap[currentTest["Ground_Truth"]]
+    response = claude.messages.create(
+                model="claude-3-5-sonnet-20241022",
+                max_tokens=1024,
+                messages=[{"role": "user", 
+                           "content": [
+            {"type": "text", "text": instruction + prompt + currentTest["Recitation"]},
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": currentImage}}]}]
+            )
+    return response
+
+def callGPT(currentTest):
+    currentImage = base64FileMap[currentTest["Ground_Truth"]]
+    response = gpt.chat.completions.create(
+                model="gpt-4o",
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": instruction + prompt + currentTest["Recitation"]},
+                            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{currentImage}"}}
+                        ]
+                    }
+                ],
+                max_tokens=2000
+            )
+    return response
+
+# def callDeepSeek(currentTest):
+#     currentImage = base64FileMap[currentTest["Ground_Truth"]]
+#     response = deepseek.chat.completions.create(
+#                 model="deepseek-reasoner",
+#                  messages=[
+#                     {
+#                         "role": "user",
+#                         "content": [
+#                             {"type": "text", "text": instruction + prompt + currentTest["Recitation"]},
+#                             {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{currentImage}"}}
+#                         ]
+#                     }
+#                 ],
+#                 max_tokens=2000
+#             )   
+#     return response
+
+# def callLlama(currentTest): 
+#     currentImage = base64FileMap[currentTest["Ground_Truth"]]
+#     response = llama.chat.completions.create(
+#                 model="llama3.2-11b-vision",
+#                 messages=[
+#                     {
+#                         "role": "user",
+#                         "content": [
+#                             {"type": "text", "text": instruction + prompt + currentTest["Recitation"]},
+#                             {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{currentImage}"}}
+#                         ]
+#                     }
+#                 ],
+#                 max_tokens=2000
+#             )
+#     return response
 
 def test(modelName, responses, testMaterials):
     for i in range(0, len(testMaterials)):
         currentTest = testMaterials.iloc[i]
         info = []
-        with open(currentTest["Ground_Truth"], "rb") as image_file:
-            image_data = base64.b64encode(image_file.read()).decode('utf-8')
-
         start_time = time.time()
         if (modelName == "Gemini"):
-            file = geminiFileMap[currentTest["Ground_Truth"]]
-            response = gemini.generate_content(
-                contents=[instruction, prompt, currentTest["Recitation"], file]
-            )
-            info.append(' '.join(response.text.splitlines()))
+            info.append(' '.join(callGemini(currentTest).text.splitlines()))
         elif (modelName == "Claude"):
-            response = claude.messages.create(
-                model="claude-3-5-sonnet-20241022",
-                max_tokens=1024,
-                messages=[{"role": "user", 
-                           "content": [
-            {"type": "text", "text": [instruction, prompt, currentTest["Recitation"]]},
-            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": image_data}}]}]
-            )
-            info.append(response.content)
+            info.append(' '.join(callClaude(currentTest).content[0].text.splitlines())) 
         elif (modelName == "GPT"):
-            response = gpt.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": [instruction, prompt, currentTest["Recitation"]]},
-                            {"type": "image_url", "image_url": f"data:image/png;base64,{image_data}"}
-                        ]
-                    }
-                ],
-                max_tokens=2000
-            )
-            info.append(response.choices[0].message.content)
-
-        elif (modelName == "DeepSeek"):
-            response = deepseek.chat.completions.create(
-                model="deepseek-chat",
-                 messages=[
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": [instruction, prompt, currentTest["Recitation"]]},
-                            {"type": "image_url", "image_url": f"data:image/png;base64,{image_data}"}
-                        ]
-                    }
-                ],
-                max_tokens=2000
-            )   
-            info.append(response.choices[0].message.content)
-
-        elif (modelName == "Llama"):
-            api_request_json = {
-            "model": "llama3.1-70b",
-            "messages": [
-                {"role": "user", "content":  [
-                            {"type": "text", "text": [instruction, prompt, currentTest["Recitation"]]},
-                            {"type": "image_url", "image_url": f"data:image/png;base64,{image_data}"}
-                        ]},
-            ],
-            "max_tokens": 2000
-            }
-            response = llama.run(api_request_json)
-            info.append(response.choices[0].message.content)
-
+            info.append(' '.join(callGPT(currentTest).choices[0].message.content.splitlines()))
+        # elif (modelName == "DeepSeek"):
+        #     info.append(' '.join(callDeepSeek(currentTest).choices[0].message.content.splitlines()))
+        # elif (modelName == "Llama"):
+        #     info.append(' '.join(callLlama(currentTest).choices[0].message.content.splitlines()))
         end_time = time.time()
+
         info.append(currentTest["Ground_Truth"])
         info.append(str(end_time - start_time) + " seconds")
         info.append(modelName)
+        info.append(currentTest['Recitation'])
         print(info)
         responses.append(info)
 
 def testAll(testMaterials):
     responses = []
     uploadAll(testMaterials)
+    test("Gemini", responses, testMaterials)
+    test("Claude", responses, testMaterials)
     test("GPT", responses, testMaterials)
-
     return responses
 
 frame = testAll(pd.read_csv("Code\TestMaterials\Tests.csv"))
@@ -132,63 +158,3 @@ frame = np.array(frame)
 print(frame.shape)
 frame = pd.DataFrame(frame, columns=columns)
 frame.to_csv("Code/TestResults/TestResult.csv", index= None)
-
-
-# message = claude.messages.create(
-#     model="claude-3-5-sonnet-20241022",
-#     max_tokens=1024,
-#     messages=[
-#         {"role": "user", "content": "Explain how AI works"}
-#     ]
-# )
-# print(message)
-
-
-
-
-
-# response = deepseek.chat.completions.create(
-#     model="deepseek-chat",
-#     messages=[
-#         {"role": "system", "content": "You are a helpful assistant"},
-#         {"role": "user", "content": "Hello"},
-#     ],
-#     stream=False
-# )
-
-# print(response.choices[0].message.content)
-
-
-# api_request_json = {
-#     "model": "llama3.1-70b",
-#     "messages": [
-#         {"role": "user", "content": "What is the weather like in Boston?"},
-#     ],
-#     "functions": [
-#         {
-#             "name": "get_current_weather",
-#             "description": "Get the current weather in a given location",
-#             "parameters": {
-#                 "type": "object",
-#                 "properties": {
-#                     "location": {
-#                         "type": "string",
-#                         "description": "The city and state, e.g. San Francisco, CA",
-#                     },
-#                     "days": {
-#                         "type": "number",
-#                         "description": "for how many days ahead you wants the forecast",
-#                     },
-#                     "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]},
-#                 },
-#             },
-#             "required": ["location", "days"],
-#         }
-#     ],
-#     "stream": False,
-#     "function_call": "get_current_weather",
-# }
-
-# # Execute the Request
-# response = llama.run(api_request_json)
-# print(json.dumps(response.json(), indent=2))
