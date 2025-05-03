@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>AI Chat + STT</title>
+  <style>
+    body { font-family: Arial; padding: 1rem; }
+    #chat { height: 300px; overflow-y: auto; border: 1px solid #ccc; margin-bottom: 1rem; padding: 1rem; }
+    textarea { width: 100%; height: 60px; }
+    button { margin-top: 0.5rem; }
+  </style>
+</head>
+<body>
+  <h2>🎤 AI Chat with STT</h2>
+  <div id="chat"></div>
+  <textarea id="message" placeholder="Say or type something..."></textarea><br>
+  <button onclick="sendMessage()">💬 Send</button>
+  <button onclick="toggleMic()">🎙 Start/Stop Mic</button>
+
+  <script>
+    const chatBox = document.getElementById("chat");
+    const messageInput = document.getElementById("message");
+    let ws = new WebSocket("ws://localhost:8001");
+    let micStream, audioCtx, processor;
+
+    ws.onmessage = (event) => {
+      const data = JSON.parse(event.data);
+      if (data.type === "realtime") {
+        messageInput.value = data.text;
+      } else if (data.type === "fullSentence") {
+        messageInput.value += (messageInput.value.endsWith("\n") ? "" : "\n") + data.text + "\n";
+      } else if (data.type === "aiChunk") {
+        appendToChat("🤖 " + data.text, false);
+      } else if (data.type === "aiDone") {
+        appendToChat("---", false);
+      }
+    };
+
+    function appendToChat(text, user = true) {
+      const msg = document.createElement("div");
+      msg.textContent = (user ? "🧑 " : "") + text;
+      chatBox.appendChild(msg);
+      chatBox.scrollTop = chatBox.scrollHeight;
+    }
+
+    function sendMessage() {
+      const text = messageInput.value.trim();
+      if (!text) return;
+      appendToChat(text, true);
+      ws.send(JSON.stringify({ type: "text", message: text }));
+      messageInput.value = "";
+    }
+
+    async function toggleMic() {
+      if (micStream) {
+        micStream.getTracks().forEach(t => t.stop());
+        processor.disconnect();
+        audioCtx.close();
+        micStream = null;
+        return;
+      }
+
+      micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      audioCtx = new AudioContext();
+      const source = audioCtx.createMediaStreamSource(micStream);
+      processor = audioCtx.createScriptProcessor(4096, 1, 1);
+      processor.onaudioprocess = (e) => {
+        const input = e.inputBuffer.getChannelData(0);
+        const int16 = new Int16Array(input.length);
+        for (let i = 0; i < input.length; i++) {
+          int16[i] = Math.min(1, Math.max(-1, input[i])) * 32767;
+        }
+        const meta = new TextEncoder().encode(JSON.stringify({ sampleRate: audioCtx.sampleRate }));
+        const header = new Uint8Array(4);
+        new DataView(header.buffer).setUint32(0, meta.length, true);
+        const payload = new Uint8Array(4 + meta.length + int16.byteLength);
+        payload.set(header, 0);
+        payload.set(meta, 4);
+        payload.set(new Uint8Array(int16.buffer), 4 + meta.length);
+        ws.send(payload.buffer);
+      };
+      source.connect(processor);
+      processor.connect(audioCtx.destination);
+    }
+  </script>
+</body>
+</html>

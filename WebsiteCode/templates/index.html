@@ -149,7 +149,7 @@
     <div id="input-area">
         <textarea id="message" placeholder="Type a message..." rows="3" disabled></textarea>
         <button onclick="sendMessage()">Send</button>
-        <button onclick="startSpeechToText()">Speak</button>
+        <button id="speakButton" onclick="">Start Speech to Text</button>
         <input type="file" id="fileInput" onchange="uploadFile()" accept=".pdf,.jpg,.jpeg,.png">
     </div>
 
@@ -157,21 +157,51 @@
         const ws = new WebSocket("ws://localhost:8000/ws");
         const allowedExtensions = ["pdf", "jpg", "jpeg", "png"];
         let fileUploaded = false;
+        let currentAIMessage = null;
+        let displayDiv = document.getElementById('message');
+        let sttButton = document.getElementById('speakButton');
+        let micStream, audioCtx, processor;
+        let fullSentences = [];
+        let sttActive = false;
+
+        navigator.mediaDevices.getUserMedia({ audio: true })
+
+        sttButton.addEventListener("click", async () => {
+            if (!sttActive) {
+                await startSTT();
+                sttButton.textContent = "Stop Speech to Text";
+            } else {
+                stopSTT();
+                sttButton.textContent = "Start Speech to Text";
+            }
+            sttActive = !sttActive;
+        });
 
         ws.onmessage = (event) => {
-            try {
-                const data = JSON.parse(event.data);
-                if (data.message) {
-                    displayMessage(data.message, "ai");
-                } else {
-                    console.error("Invalid message format:", data);
+            const data = JSON.parse(event.data);
+            if (data.type === "realtime") {
+                displayRealtimeText(data.text, displayDiv);
+            } else if (data.type === 'fullSentence') {
+                fullSentences.push(data.text);
+                displayRealtimeText("", displayDiv); // Refresh display with new full sentence
+            }
+            else if (data.type === "AI") {
+                if (!currentAIMessage) {
+                    currentAIMessage = document.createElement("div");
+                    currentAIMessage.classList.add("message", "ai");
+                    document.getElementById("chat").appendChild(currentAIMessage);
                 }
-            } catch (error) {
-                console.error("Error parsing JSON:", error);
+
+                currentAIMessage.textContent += data.text;
+                document.getElementById("chat").scrollTop = document.getElementById("chat").scrollHeight;
             }
         };
 
-        document.getElementById("message").addEventListener("keydown", function (event) {
+        ws.onclose = () => {
+            console.log("WebSocket closed.");
+        };
+
+        displayDiv.addEventListener("keydown", function (event) {
             if (event.key === "Enter") {
                 if (event.shiftKey) {
                     event.preventDefault();
@@ -182,6 +212,35 @@
                 }
             }
         });
+
+        function sendMessage() {
+            if (!fileUploaded) {
+                alert("Please upload a file before sending messages.");
+                return;
+            }
+            const text = displayDiv.value.trim();
+
+            if (!text) return;
+
+
+            if (ws.readyState === WebSocket.OPEN) {
+                ws.send(text);
+
+                // Always show user's message immediately
+                displayMessage(text, "user");
+
+                // Reset streamed AI message placeholder
+                currentAIMessage = document.createElement("div");
+                currentAIMessage.classList.add("message", "ai");
+                currentAIMessage.textContent = ""; // start empty
+                document.getElementById("chat").appendChild(currentAIMessage);
+                displayDiv.value = "";
+            }
+        }
+
+        function displayRealtimeText(realtimeText, displayDiv) {
+            displayDiv.value = fullSentences.join(" ") + realtimeText;
+        }
 
         function enableTextInput() {
             const fileInput = document.getElementById("fileInput1");
@@ -195,58 +254,15 @@
                 if (!allowedExtensions.includes(fileExtension)) {
                     alert("Invalid file type! Please upload a supported file.");
                     fileInput.value = ""; // Reset input
+                    fullSentences = []
                     return;
                 }
 
                 // Update displayed file name
-                document.getElementById("message").disabled = false;
+                displayDiv.disabled = false;
                 uploadFile("fileInput1")
             }
         }
-
-        function sendMessage() {
-            if (!fileUploaded) {
-                alert("Please upload a file before sending messages.");
-                return;
-            }
-            const messageInput = document.getElementById("message");
-            const text = messageInput.value.trim();
-
-            if (!text) return;
-
-
-            if (ws.readyState === WebSocket.OPEN) {
-                ws.send(text);
-
-                // ✅ Always show user's message immediately
-                displayMessage(text, "user");
-
-                // 🧠 Reset streamed AI message placeholder
-                currentAIMessage = document.createElement("div");
-                currentAIMessage.classList.add("message", "ai");
-                currentAIMessage.textContent = ""; // start empty
-                document.getElementById("chat").appendChild(currentAIMessage);
-                messageInput.value = "";
-            }
-        }
-
-
-        let currentAIMessage = null;
-
-        ws.onmessage = (event) => {
-            if (!currentAIMessage) {
-                currentAIMessage = document.createElement("div");
-                currentAIMessage.classList.add("message", "ai");
-                document.getElementById("chat").appendChild(currentAIMessage);
-            }
-
-            currentAIMessage.textContent += event.data;
-            document.getElementById("chat").scrollTop = document.getElementById("chat").scrollHeight;
-        };
-
-        ws.onclose = () => {
-            console.log("WebSocket closed.");
-        };
 
         function displayMessage(text, sender) {
             const chat = document.getElementById("chat");
@@ -288,10 +304,9 @@
                 })
                 .then(data => {
                     // Ensure correct file name is passed to chat
-                    // displayMessage(`File Uploaded: ${file.name}`, "user");
                     displayMessage(data.message, "ai");
 
-                    document.getElementById("message").disabled = false;
+                    displayDiv.disabled = false;
                     fileUploaded = true;
 
                     // Hide overlay
@@ -302,29 +317,38 @@
                     alert("Error uploading file: " + error.message);
                 });
         }
+        async function startSTT() {
+            if (micStream) return;              // already running
+            micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            audioCtx = new AudioContext();
+            const source = audioCtx.createMediaStreamSource(micStream);
+            processor = audioCtx.createScriptProcessor(256, 1, 1);
+            source.connect(processor);
+            processor.connect(audioCtx.destination);
 
-        // Speech-to-Text Integration
-        function startSpeechToText() {
-            const recognition = new RealtimeSTT();
-
-            recognition.onresult = function (event) {
-                const messageInput = document.getElementById("message");
-                let transcript = event.results[event.results.length - 1][0].transcript;
-
-                if (messageInput.value.length > 0) {
-                    messageInput.value += " " + transcript;
-                } else {
-                    messageInput.value = transcript;
+            processor.onaudioprocess = (e) => {
+                const input = e.inputBuffer.getChannelData(0);
+                const output = new Int16Array(input.length);
+                for (let i = 0; i < input.length; i++) {
+                    output[i] = Math.max(-32768, Math.min(32767, input[i] * 32768));
                 }
-            };
 
-            recognition.onerror = function (event) {
-                console.error("Speech recognition error:", event.error);
+                let metadata = JSON.stringify({ sampleRate: audioCtx.sampleRate });
+                let metadataBytes = new TextEncoder().encode(metadata);
+                let metadataLength = new ArrayBuffer(4);
+                let metadataLengthView = new DataView(metadataLength);
+                metadataLengthView.setInt32(0, metadataBytes.byteLength, true);
+                let combinedData = new Blob([metadataLength, metadataBytes, output.buffer]);
+                ws.send(combinedData);
             };
-
-            recognition.start();
         }
-
+        function stopSTT() {
+            if (!micStream) return;             // already stopped
+            micStream.getTracks().forEach(t => t.stop());
+            processor.disconnect();
+            audioCtx.close();
+            micStream = null;
+        }
 
     </script>
 
