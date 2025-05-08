@@ -17,20 +17,8 @@ from scipy.signal import resample
 import websockets
 
 if __name__ == '__main__':
-    app = FastAPI()
     gpt = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
-    prompt = "Based off the image, how correct is the following exact verbal recitation of the material? Assume that the student can only speak the material, meaning all symbols are pronounced. Please give an accurate score between 0 and 10, with 0 being the least accurate and 10 being perfect. Penalize errors in important information more heavily than other errors. Please also provide corrections if necessary. " 
-
-    # Allow frontend access
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=["*"],  # Change "*" to your frontend URL if needed
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
-
-   
+    prompt = "Using the image as the source for a perfect recitation, how correct is the following exact verbal recitation of the material? Assume that the student can only speak the material, meaning all symbols are pronounced. Please give an accurate score between 0 and 10, with 0 being the least accurate and 10 being perfect. Penalize errors in important information more heavily than other errors. Please also provide corrections if necessary. Recitation: " 
 
     # Store active WebSocket connections
     active_connections = []
@@ -40,6 +28,9 @@ if __name__ == '__main__':
     filename = None
     ws = None
     mainloop = None
+    recorder_ready = threading.Event()
+    recorder = None
+    is_running = True
 
     def encode64():
         image_data = base64.b64encode(currentFile).decode('utf-8')
@@ -68,14 +59,15 @@ if __name__ == '__main__':
 
 
     def text_detected(text):
-        print(text)
-        asyncio.run_coroutine_threadsafe(send_to_client(json.dumps({
-                    'type': 'realtime',
-                    'text': text})), mainloop)
+        global mainloop
+        if mainloop is not None:
+            asyncio.run_coroutine_threadsafe(send_to_client(json.dumps({
+                        'type': 'realtime',
+                        'text': text})), mainloop)
 
     recorder_config = {
              'spinner': False,
-                # 'model': 'small.en', # or large-v2 or deepdml/faster-whisper-large-v3-turbo-ct2 or ...
+                'model': 'small.en', # or large-v2 or deepdml/faster-whisper-large-v3-turbo-ct2 or ...
                 'realtime_model_type': 'tiny.en', # or small.en or distil-small.en or ...
                 'language': 'en',
                 'silero_sensitivity': 0.05,
@@ -90,46 +82,50 @@ if __name__ == '__main__':
                 'beam_size': 5,
                 'beam_size_realtime': 3,
                 'no_log_file': True,
-                'initial_prompt': (
-                    "End incomplete sentences with ellipses.\n"
-                    "Examples:\n"
-                    "Complete: The sky is blue.\n"
-                    "Incomplete: When the sky...\n"
-                    "Complete: She walked home.\n"
-                    "Incomplete: Because he...\n"
-                ),
                 'use_microphone': False,
-                'on_realtime_transcription_update': text_detected,
+                'on_realtime_transcription_stabilized': text_detected,
         }
-    recorder = AudioToTextRecorder(**recorder_config)
-
-    @asynccontextmanager
-    async def lifespan(app: FastAPI):
-        global main_loop
-        main_loop = asyncio.get_running_loop()
-        yield
-        quit()
     
-    @app.websocket("/ws")
-    async def handle_Client(websocket: WebSocket):
+    def run_recorder():
+        global recorder, mainloop, is_running
+        print("Initializing RealtimeSTT...")
+        recorder = AudioToTextRecorder(**recorder_config)
+        print("RealtimeSTT initialized")
+        recorder_ready.set()
+
+        # Loop indefinitely checking for full sentence output.
+        while is_running:
+            try:
+                full_sentence = recorder.text()
+                if full_sentence:
+                    if mainloop is not None:
+                        asyncio.run_coroutine_threadsafe(
+                            send_to_client(json.dumps({
+                                'type': 'fullSentence',
+                                'text': full_sentence
+                            })), mainloop)
+            except Exception as e:
+                print(f"Error in recorder thread: {e}")
+                continue
+    
+    async def handle_Client(websocket):
         global ws, recorder
-        await websocket.accept()
         active_connections.append(websocket)
         ws = websocket
         try:
-            while True:
-                message = await websocket.receive()
-                # print(message)
-                if(message["type"] == "websocket.disconnect"):
-                    break
-                if "bytes" in message:
-                    await handle_STT(websocket, message['bytes'])
-                elif 'text' in message:
-                    await handle_AI(websocket, message['text'])
+            async for message in websocket:
+                if isinstance(message, bytes):
+                    await handle_STT(message)
+                else:
+                    data = json.loads(message)
+                    if(data['type'] == "file"):
+                        await upload_file(data)
+                    elif data['type'] == "text":
+                        await handle_AI(data['text'])
         finally:
             active_connections.remove(websocket)
             
-    async def handle_AI(websocket: WebSocket, data):
+    async def handle_AI(data):
         try:
             if (filetype == 'png'):
                 filecontent = {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{encode64()}"}}
@@ -153,14 +149,14 @@ if __name__ == '__main__':
             for chunk in response:
                 token = chunk.choices[0].delta.content
                 if token:
-                    await websocket.send_text(json.dumps({"type":"AI", "text":token}))
+                    await send_to_client(json.dumps({"type":"AI", "text":token}))
                     await asyncio.sleep(0.05)  # Yield control to handle other tasks
         except Exception:
-            active_connections.remove(websocket)
+            active_connections.remove(ws)
             recorder.stop()
             recorder.shutdown()
 
-    async def handle_STT(websocket, data):
+    async def handle_STT(data):
         try: 
             # Read the metadata length (first 4 bytes)
             metadata_length = int.from_bytes(data[:4], byteorder='little')
@@ -172,31 +168,52 @@ if __name__ == '__main__':
             chunk = data[4+metadata_length:]
             resampled_chunk = decode_and_resample(chunk, sample_rate, 16000)
             recorder.feed_audio(resampled_chunk)
-            # full_sentence = recorder.text()
-            # if full_sentence:
-            #     await send_to_client(json.dumps({'type': 'fullSentence', 'text': full_sentence}))
-            # print(full_sentence)
         except Exception as e:
                 print(f"Error: {e}" )
     
-
     async def send_to_client(message):
         print(message)
-        await ws.send_text(message)
+        await ws.send(message)
 
-    @app.post("/upload/")
-    async def upload_file(file: UploadFile = File(...)):
+    async def upload_file(data):
         global currentFile, filetype, filename
-        file_extension = file.filename.split('.')[-1].lower()
-        if file_extension not in ALLOWED_EXTENSIONS:
-            raise HTTPException(status_code=400, detail="Invalid file type! Please upload a supported file.")
-
-        uploaded = await file.read()
-        filetype = file_extension
-        filename = file.filename
-        currentFile = uploaded
-        return {"message": f"The memorization material has been set to '{file.filename}'"}
+        header, b64 = data["fileData"].split(",", 1)
+        file_bytes = base64.b64decode(b64)
+        # save into currentFile, set filetype & filename
+        currentFile = file_bytes
+        filetype = data["filename"].split(".")[-1].lower()
+        filename = data["filename"]
+        # send back an ack
+        await send_to_client(json.dumps({
+        "type": "upload_ack",
+        "filename": filename,
+        "message": f"The memorization material has been set to '{filename}'"
+        }))
     
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    async def main():
+        global mainloop
+        mainloop = asyncio.get_running_loop()
+
+        recorder_thread = threading.Thread(target=run_recorder)
+        recorder_thread.daemon = True
+        recorder_thread.start()
+        recorder_ready.wait()
+
+        print("Server started. Press Ctrl+C to stop the server.")
+        async with websockets.serve(handle_Client, "localhost", 8000):
+            try:
+                await asyncio.Future()  # run forever
+            except asyncio.CancelledError:
+                print("\nShutting down server...")
+
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        is_running = False
+        recorder.stop()
+        recorder.shutdown()
+    finally:
+        if recorder:
+            del recorder
 
 

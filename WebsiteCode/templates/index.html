@@ -4,7 +4,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>WebSocket AI Chat</title>
+    <title>AI Study Tool</title>
     <style>
         * {
             margin: 0;
@@ -62,10 +62,21 @@
         #input-area {
             width: 80%;
             max-width: 800px;
-            display: flex;
-            align-items: center;
-            gap: 10px;
             margin-top: 20px;
+        }
+
+
+        .input-top-row {
+            display: flex;
+            width: 100%;
+            gap: 10px;
+            margin-bottom: 10px;
+        }
+
+        .input-bottom-row {
+            display: flex;
+            width: 100%;
+            gap: 10px;
         }
 
         textarea {
@@ -74,6 +85,8 @@
             padding: 10px;
             border-radius: 5px;
             resize: none;
+            height: 100px;
+            width: 300px
         }
 
         button {
@@ -134,7 +147,13 @@
         }
     </style>
 
-
+    <script>
+        window.MathJax = {
+            tex: { inlineMath: [['$', '$'], ['\\(', '\\)']] },
+            svg: { fontCache: 'global' }
+        };
+    </script>
+    <script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-svg.js"></script>
 </head>
 
 <body>
@@ -147,35 +166,55 @@
         </div>
     </div>
     <div id="input-area">
-        <textarea id="message" placeholder="Type a message..." rows="3" disabled></textarea>
-        <button onclick="sendMessage()">Send</button>
-        <button id="speakButton" onclick="">Start Speech to Text</button>
-        <input type="file" id="fileInput" onchange="uploadFile()" accept=".pdf,.jpg,.jpeg,.png">
+        <div class="input-top-row">
+            <textarea id="message" placeholder="Type a message..." rows="5" disabled></textarea>
+            <button onclick="sendMessage()">Send</button>
+        </div>
+        <div class="input-bottom-row">
+            <button id="speakButton">Start Speech to Text</button>
+            <input type="file" id="fileInput" onchange="uploadFile()" accept=".pdf,.jpg,.jpeg,.png">
+        </div>
     </div>
 
+
     <script>
-        const ws = new WebSocket("ws://localhost:8000/ws");
+        const ws = new WebSocket("ws://localhost:8000");
         const allowedExtensions = ["pdf", "jpg", "jpeg", "png"];
         let fileUploaded = false;
         let currentAIMessage = null;
-        let displayDiv = document.getElementById('message');
-        let sttButton = document.getElementById('speakButton');
+        const displayDiv = document.getElementById('message');
+        const sttButton = document.getElementById('speakButton');
         let micStream, audioCtx, processor;
         let fullSentences = [];
         let sttActive = false;
+        const chatDiv = document.getElementById("chat");
+        let messages = [];        // { text: "...", sender: "user"|"ai" }
+        let chatEnabled = true;   // controls whether we show them or hide them
+
 
         navigator.mediaDevices.getUserMedia({ audio: true })
 
         sttButton.addEventListener("click", async () => {
             if (!sttActive) {
+                clearChatView();
                 await startSTT();
-                sttButton.textContent = "Stop Speech to Text";
             } else {
                 stopSTT();
-                sttButton.textContent = "Start Speech to Text";
             }
             sttActive = !sttActive;
         });
+
+        displayDiv.addEventListener("input", () => {
+            clearChatView();
+        })
+        ws.onopen = (event) => {
+            console.log("WebSocket opened.");
+            displayDiv.value = "";
+            ['fileInput', 'fileInput1'].forEach(id => {
+                const input = document.getElementById(id);
+                if (input) input.value = '';
+            });
+        }
 
         ws.onmessage = (event) => {
             const data = JSON.parse(event.data);
@@ -186,14 +225,7 @@
                 displayRealtimeText("", displayDiv); // Refresh display with new full sentence
             }
             else if (data.type === "AI") {
-                if (!currentAIMessage) {
-                    currentAIMessage = document.createElement("div");
-                    currentAIMessage.classList.add("message", "ai");
-                    document.getElementById("chat").appendChild(currentAIMessage);
-                }
-
-                currentAIMessage.textContent += data.text;
-                document.getElementById("chat").scrollTop = document.getElementById("chat").scrollHeight;
+                displayMessage(data.text, "ai");
             }
         };
 
@@ -224,7 +256,8 @@
 
 
             if (ws.readyState === WebSocket.OPEN) {
-                ws.send(text);
+                ws.send(JSON.stringify({ type: "text", text: text }));
+                stopSTT();
 
                 // Always show user's message immediately
                 displayMessage(text, "user");
@@ -235,7 +268,29 @@
                 currentAIMessage.textContent = ""; // start empty
                 document.getElementById("chat").appendChild(currentAIMessage);
                 displayDiv.value = "";
+                chatEnabled = true;
+                renderChat();
             }
+        }
+
+        function renderChat() {
+            chatDiv.innerHTML = "";
+            if (!chatEnabled) return;
+            for (const msg of messages) {
+                const el = document.createElement("div");
+                el.classList.add("message", msg.sender);
+                // Wrap content in a <span> so MathJax can typeset it
+                el.innerHTML = `<span class="mathjax">${msg.text}</span>`;
+                chatDiv.appendChild(el);
+            }
+            chatDiv.scrollTop = chatDiv.scrollHeight;
+            // Ask MathJax to typeset any new math
+            MathJax.typesetPromise && MathJax.typesetPromise();
+        }
+
+        function clearChatView() {
+            chatEnabled = false;
+            renderChat();          // this will blank out the <div id="chat">
         }
 
         function displayRealtimeText(realtimeText, displayDiv) {
@@ -264,16 +319,19 @@
             }
         }
 
-        function displayMessage(text, sender) {
-            const chat = document.getElementById("chat");
-            const messageElement = document.createElement("div");
-            messageElement.classList.add("message", sender);
-            messageElement.textContent = text;
-            chat.appendChild(messageElement);
-            chat.scrollTop = chat.scrollHeight;
+        function displayMessage(text, sender, forceNew = false) {
+            const lastIsAI = messages.length > 0 && messages[messages.length - 1].sender === sender;
+            if (!forceNew && sender === "ai" && lastIsAI) {
+                // append to last AI message
+                messages[messages.length - 1].text += text;
+            } else {
+                // new message
+                messages.push({ text, sender });
+            }
+            renderChat();
         }
 
-        function uploadFile(source = "fileInput") {
+        async function uploadFile(source = "fileInput") {
             const fileInput = document.getElementById(source);
             const file = fileInput.files[0];
             if (!file) {
@@ -281,44 +339,56 @@
                 return;
             }
 
-            // Get file extension and validate
+            // Validate extension
             const fileExtension = file.name.split('.').pop().toLowerCase();
-
             if (!allowedExtensions.includes(fileExtension)) {
                 alert("Invalid file type! Please upload a supported file.");
                 return;
             }
 
-            const formData = new FormData();
-            formData.append("file", file);
+            // Read the file as a base64 data URL
+            const dataURL = await new Promise((resolve, reject) => {
+                const reader = new FileReader();
+                reader.onerror = () => reject(reader.error);
+                reader.onload = () => resolve(reader.result);
+                reader.readAsDataURL(file);
+            });
 
-            fetch("http://localhost:8000/upload/", {
-                method: "POST",
-                body: formData
-            })
-                .then(response => {
-                    if (!response.ok) {
-                        return response.json().then(err => { throw new Error(err.error || "Unknown error"); });
-                    }
-                    return response.json();
-                })
-                .then(data => {
-                    // Ensure correct file name is passed to chat
-                    displayMessage(data.message, "ai");
+            // Send over WebSocket as a JSON message
+            const payload = {
+                type: "file",
+                filename: file.name,
+                fileData: dataURL
+            };
+            ws.send(JSON.stringify(payload));
 
+            // Optionally, wait for an ack from the server before proceeding
+            ws.addEventListener("message", function ackListener(evt) {
+                const msg = JSON.parse(evt.data);
+                if (msg.type === "upload_ack" && msg.filename === file.name) {
+                    // server confirms it received and stored the file
+                    displayMessage(msg.message, "ai", true);
                     displayDiv.disabled = false;
                     fileUploaded = true;
-
-                    // Hide overlay
                     document.getElementById("overlay").style.display = "none";
-                })
-                .catch(error => {
-                    console.error("Error uploading file:", error);
-                    alert("Error uploading file: " + error.message);
-                });
+                    ws.removeEventListener("message", ackListener);
+                }
+            });
         }
+
+        function splitIntoSentences(text) {
+            // This regex splits on punctuation (., ?, !) but keeps it at end of each chunk
+            const regex = /[^.!?]+[.!?]*/g;
+            const matches = text.match(regex);
+            return matches ? matches.map(s => s.trim()) : [];
+        }
+
         async function startSTT() {
-            if (micStream) return;              // already running
+            if (micStream) return;
+            const existingText = displayDiv.value.trim();
+            fullSentences = splitIntoSentences(existingText);
+            displayDiv.value = "";
+            sttButton.textContent = "Stop Speech to Text";
             micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
             audioCtx = new AudioContext();
             const source = audioCtx.createMediaStreamSource(micStream);
@@ -344,6 +414,7 @@
         }
         function stopSTT() {
             if (!micStream) return;             // already stopped
+            sttButton.textContent = "Start Speech to Text";
             micStream.getTracks().forEach(t => t.stop());
             processor.disconnect();
             audioCtx.close();
